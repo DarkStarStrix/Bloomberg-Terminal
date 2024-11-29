@@ -1,75 +1,125 @@
-import requests
-from newsApi import NewsApiClient
+from alpha_vantage.timeseries import TimeSeries
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import asyncio
 from datetime import datetime
-from Config import *
+import time
+from Config import ALPHA_VANTAGE_API_KEY
 
 
-def fetch_stock_data(symbol, period='1d', interval='1m'):
-    stock = yf.Ticker (symbol)
-    hist = stock.history (period=period, interval=interval)
-    hist ['symbol'] = symbol
-    return hist
+class TechStocksPipeline:
+    def __init__(self, api_key):
+        self.ts = TimeSeries (key=api_key)
+        self.tech_symbols = [
+            "AAPL",  # Apple
+            "MSFT",  # Microsoft
+            "GOOGL",  # Google
+            "AMZN",  # Amazon
+            "META",  # Meta
+            "NVDA",  # NVIDIA
+            "TSLA"  # Tesla
+        ]
+        self.data_cache = {}
+
+    async def get_stock_data(self, symbol):
+        try:
+            data, meta_data = self.ts.get_intraday (symbol, interval='1min', outputsize='compact')
+            df = pd.DataFrame.from_dict (data, orient='index')
+            df.index = pd.to_datetime (df.index)
+            df.columns = ['open', 'high', 'low', 'close', 'volume']
+            df ['symbol'] = symbol
+            self.data_cache [symbol] = df.sort_index ()
+            # Rate limiting
+            time.sleep (12)  # Alpha Vantage free tier limit
+            return df
+        except Exception as e:
+            print (f"Error fetching data for {symbol}: {str (e)}")
+            return None
+
+    async def update_all_stocks(self):
+        tasks = []
+        for symbol in self.tech_symbols:
+            task = asyncio.create_task (self.get_stock_data (symbol))
+            tasks.append (task)
+        await asyncio.gather (*tasks)
+
+    def plot_tech_stocks(self):
+        fig = make_subplots (
+            rows=2, cols=1,
+            subplot_titles=('Stock Prices', 'Trading Volume'),
+            vertical_spacing=0.2,
+            row_heights=[0.7, 0.3]
+        )
+
+        for symbol in self.tech_symbols:
+            if symbol in self.data_cache:
+                df = self.data_cache [symbol]
+                # Price plot
+                fig.add_trace (
+                    go.Scatter (
+                        x=df.index,
+                        y=df ['close'],
+                        name=f"{symbol} Price",
+                        mode='lines'
+                    ),
+                    row=1, col=1
+                )
+                # Volume plot
+                fig.add_trace (
+                    go.Bar (
+                        x=df.index,
+                        y=df ['volume'],
+                        name=f"{symbol} Volume",
+                        opacity=0.7
+                    ),
+                    row=2, col=1
+                )
+
+        fig.update_layout (
+            title='Tech Stocks Real-Time Data',
+            height=900,
+            xaxis2_title='Time',
+            yaxis_title='Price ($)',
+            yaxis2_title='Volume'
+        )
+
+        return fig
+
+    def get_market_summary(self):
+        summary = {}
+        for symbol in self.tech_symbols:
+            if symbol in self.data_cache:
+                df = self.data_cache [symbol]
+                latest = df.iloc [-1]
+                earliest = df.iloc [0]
+                price_change = ((latest ['close'] - earliest ['close']) / earliest ['close']) * 100
+
+                summary [symbol] = {
+                    'current_price': latest ['close'],
+                    'price_change_pct': price_change,
+                    'volume': latest ['volume'],
+                    'high': df ['high'].max (),
+                    'low': df ['low'].min ()
+                }
+        return summary
 
 
-class DataPipeline:
-    def __init__(self):
-        self.newsapi = NewsApiClient (api_key=NEWS_API_KEY)
-        self.stock_data = pd.DataFrame ()
-        self.news_data = pd.DataFrame ()
+async def main():
+    pipeline = TechStocksPipeline (ALPHA_VANTAGE_API_KEY)
+    await pipeline.update_all_stocks ()
 
-    def fetch_news(self, query='stock market'):
-        articles = self.newsapi.get_everything (q=query, language='en', sort_by='publishedAt', page_size=10)
-        return pd.DataFrame (articles ['articles'])
+    # Plot stocks
+    fig = pipeline.plot_tech_stocks ()
+    fig.show ()
 
-    def process_stock_data(self):
-        all_data = []
-        for symbol in STOCK_SYMBOLS:
-            df = fetch_stock_data (symbol)
-            df = df.reset_index ()
-            df ['timestamp'] = pd.to_datetime (df ['Datetime']).dt.strftime ('%Y-%m-%d %H:%M:%S')
-            df = df [['timestamp', 'symbol', 'Close', 'Volume']]
-            df.columns = ['timestamp', 'symbol', 'price', 'volume']
-            all_data.append (df)
-
-        self.stock_data = pd.concat (all_data)
-        return self.stock_data
-
-    def process_news(self):
-        news_df = self.fetch_news ()
-        news_df ['timestamp'] = datetime.now ().strftime ('%Y-%m-%d %H:%M:%S')
-        news_df ['source_name'] = news_df ['source'].apply (lambda x: x ['name'])
-        news_df = news_df.drop ('source', axis=1)
-
-        self.news_data = news_df [['source_name', 'author', 'title', 'description',
-                                   'url', 'urlToImage', 'publishedAt', 'content', 'timestamp']]
-        return self.news_data
-
-    def get_latest_stock_price(self, symbol):
-        stock_data = self.stock_data [self.stock_data ['symbol'] == symbol]
-        if not stock_data.empty:
-            return stock_data.iloc [-1]
-        return None
-
-    def get_stock_history(self, symbol, limit=100):
-        return self.stock_data [self.stock_data ['symbol'] == symbol].tail (limit)
-
-    def get_latest_news(self, limit=5):
-        return self.news_data.head (limit)
-
-    def update(self):
-        self.process_stock_data ()
-        self.process_news ()
+    # Print market summary
+    summary = pipeline.get_market_summary ()
+    for symbol, data in summary.items ():
+        print (f"\n{symbol} Summary:")
+        for metric, value in data.items ():
+            print (f"{metric}: {value:.2f}")
 
 
-pipeline = DataPipeline ()
-pipeline.update ()  # Fetches both stock and news data
-
-# Get latest stock data
-latest_tesla = pipeline.get_latest_stock_price ('TSLA')
-
-# Get news
-latest_news = pipeline.get_latest_news ()
-
-# Get historical data
-tesla_history = pipeline.get_stock_history ('TSLA')
+if __name__ == "__main__":
+    asyncio.run (main ())
